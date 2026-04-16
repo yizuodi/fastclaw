@@ -1,0 +1,15 @@
+{
+  "name": "fastclaw-webchat",
+  "version": "1.0.0",
+  "description": "A lightweight full-stack AI chat app powered by OpenClaw",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": ["openclaw", "webchat", "ai"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.20.0"
+  }
+}
