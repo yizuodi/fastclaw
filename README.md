@@ -1,6 +1,6 @@
-# FastClaw WebChat
+# FastClaw
 
-轻量级全栈 AI 聊天应用，包含 Node.js 后端代理 + 现代前端界面。后端通过 WebSocket 连接 [OpenClaw](https://github.com/openclaw/openclaw) Gateway，前端提供美观的聊天体验。一个 `npm start` 即可运行。
+轻量级 AI 聊天应用，包含 Node.js 后端代理 + 现代前端界面。在不使用websocket协议的前提下与你的OpenClaw对话。后端通过 WebSocket 连接 [OpenClaw](https://github.com/openclaw/openclaw) Gateway，前端提供美观的聊天体验。一个 `npm start` 即可运行。
 
 ## ✨ 功能特性
 
