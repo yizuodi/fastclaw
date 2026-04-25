@@ -1,12 +1,40 @@
-// FastClaw WebChat - Client App (single session, no sidebar)
+// FastClaw WebChat - Client App (single session, configurable)
 (function () {
   'use strict';
 
-  const SHARED_SESSION = 'webchat-shared';
+  const DEFAULT_APP_CONFIG = {
+    branding: {
+      name: 'FastClaw',
+      emoji: '🐾',
+      avatarBot: 'FC',
+      avatarUser: 'U',
+      welcomeTitle: 'Welcome to FastClaw',
+      welcomeSubtitle: 'Send a message to start chatting.',
+      documentTitle: 'FastClaw Chat'
+    },
+    session: {
+      key: 'webchat-shared',
+      historyLimit: 100,
+      pollLimit: 20,
+      historyPageSize: 100
+    },
+    polling: {
+      clientStreamingIntervalMs: 1000,
+      clientProcessingIntervalMs: 1500
+    },
+    ui: {
+      toolResultPreviewChars: 500
+    }
+  };
+
+  let appConfig = structuredClone(DEFAULT_APP_CONFIG);
+  let currentSessionId = appConfig.session.key;
   let polling = false;
   let pollTimer = null;
   let lastMessageCount = 0;
   let showTools = false;
+  let availableModels = [];
+  let currentModel = localStorage.getItem('oc_model') || '';
 
   function getToken() { return localStorage.getItem('oc_token') || ''; }
   function authHeaders() {
@@ -14,13 +42,49 @@
     return t ? { 'Authorization': 'Bearer ' + t } : {};
   }
 
+  function mergeConfig(input) {
+    const cfg = input || {};
+    appConfig = {
+      branding: { ...DEFAULT_APP_CONFIG.branding, ...(cfg.branding || {}) },
+      session: { ...DEFAULT_APP_CONFIG.session, ...(cfg.session || {}) },
+      polling: { ...DEFAULT_APP_CONFIG.polling, ...(cfg.polling || {}) },
+      ui: { ...DEFAULT_APP_CONFIG.ui, ...(cfg.ui || {}) }
+    };
+    currentSessionId = appConfig.session.key || DEFAULT_APP_CONFIG.session.key;
+  }
+
+  async function loadAppConfig() {
+    try {
+      const res = await fetch('/api/config', { headers: authHeaders(), cache: 'no-store' });
+      if (res.ok) mergeConfig(await res.json());
+    } catch (_) {
+      mergeConfig(DEFAULT_APP_CONFIG);
+    }
+    applyBranding();
+  }
+
+  function applyBranding() {
+    const b = appConfig.branding;
+    document.title = b.documentTitle || `${b.name} Chat`;
+    setText('#brand-name', b.name);
+    setText('#welcome-icon', b.emoji);
+    setText('#welcome-title', b.welcomeTitle || `Welcome to ${b.name}`);
+    setText('#welcome-subtitle', b.welcomeSubtitle);
+  }
+
+  function setText(selector, text) {
+    const el = document.querySelector(selector);
+    if (el) el.textContent = text || '';
+  }
+
   function showLogin() {
+    const b = appConfig.branding;
     const overlay = document.createElement('div');
     overlay.id = 'login-overlay';
     overlay.innerHTML = `
       <div class="login-card">
-        <div class="login-logo">🐾</div>
-        <h2>FastClaw</h2>
+        <div class="login-logo">${escapeHtml(b.emoji || '🐾')}</div>
+        <h2>${escapeHtml(b.name || 'FastClaw')}</h2>
         <form id="login-form">
           <input type="password" id="login-pw" placeholder="输入访问密码" autocomplete="off" />
           <button type="submit" id="login-btn">进入</button>
@@ -40,15 +104,20 @@
             localStorage.removeItem('oc_token');
             document.getElementById('login-error').textContent = '密码错误';
             document.getElementById('login-pw').value = '';
-          } else { overlay.remove(); startApp(); }
+          } else {
+            overlay.remove();
+            loadAppConfig().finally(startApp);
+          }
         });
     });
     document.getElementById('login-pw').focus();
   }
 
-  function init() {
+  async function init() {
     const saved = localStorage.getItem('oc_theme') || 'light';
     document.documentElement.setAttribute('data-theme', saved);
+    await loadAppConfig();
+
     const toggle = document.getElementById('theme-toggle');
     if (toggle) {
       toggle.addEventListener('click', () => {
@@ -61,7 +130,7 @@
     if (getToken()) {
       fetch('/api/status', { headers: authHeaders() }).then(r => {
         if (r.status === 401) { localStorage.removeItem('oc_token'); showLogin(); }
-        else startApp();
+        else loadAppConfig().finally(startApp);
       }).catch(() => startApp());
     } else { showLogin(); }
   }
@@ -73,8 +142,16 @@
     const chatStatus = document.getElementById('chat-status');
     const refreshBtn = document.getElementById('refresh-btn');
     const toolsBtn = document.getElementById('tools-toggle');
+    const modelSelect = document.getElementById('model-select');
 
-    // ---- Tools Toggle ----
+    loadModels();
+    if (modelSelect) {
+      modelSelect.addEventListener('change', () => {
+        currentModel = modelSelect.value;
+        localStorage.setItem('oc_model', currentModel);
+      });
+    }
+
     if (toolsBtn) {
       updateToolsBtn();
       toolsBtn.addEventListener('click', () => {
@@ -91,13 +168,11 @@
       toolsBtn.classList.toggle('active', showTools);
     }
 
-    // ---- Refresh ----
     refreshBtn.addEventListener('click', () => {
       refreshBtn.classList.add('spinning');
       loadHistory().finally(() => setTimeout(() => refreshBtn.classList.remove('spinning'), 300));
     });
 
-    // ---- Input ----
     msgInput.addEventListener('input', () => {
       msgInput.style.height = 'auto';
       msgInput.style.height = Math.min(msgInput.scrollHeight, 150) + 'px';
@@ -119,9 +194,10 @@
       chatStatus.style.display = 'inline';
       fetch('/api/send', {
         method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() },
-        body: JSON.stringify({ message: text }),
+        body: JSON.stringify({ message: text, model: currentModel }),
       }).then(r => r.json()).then(data => {
         if (data.error) throw new Error(data.error);
+        currentSessionId = data.sessionId || appConfig.session.key || currentSessionId;
         startPolling();
       }).catch(err => {
         appendMessage('error', [{ type: 'text', text: 'Send failed: ' + err.message }]);
@@ -129,31 +205,85 @@
       });
     });
 
+    let earliestTimestamp = null;
+    let loadingMore = false;
+
     loadHistory();
     msgInput.focus();
 
-    // ---- History ----
     async function loadHistory() {
       try {
-        const data = await (await fetch('/api/history', { headers: authHeaders() })).json();
+        const limit = Number(appConfig.session.historyLimit) || DEFAULT_APP_CONFIG.session.historyLimit;
+        const data = await (await fetch(`/api/history?limit=${encodeURIComponent(limit)}`, { headers: authHeaders() })).json();
         if (data.messages && data.messages.length > 0) {
           const welcome = msgContainer.querySelector('.welcome-msg');
           if (welcome) welcome.remove();
-          const newMsgs = data.messages.slice(lastMessageCount);
-          if (newMsgs.length > 0) {
-            newMsgs.forEach(m => appendMessage(m.role, m.content, m.timestamp));
-            lastMessageCount = data.messages.length;
-          }
+          msgContainer.innerHTML = '';
+          data.messages.forEach(m => appendMessage(m.role, m.content, m.timestamp));
+          const firstRow = msgContainer.querySelector('.msg-row');
+          if (firstRow && firstRow.dataset.ts) earliestTimestamp = firstRow.dataset.ts;
+          if (data.messages.length >= getHistoryPageSize()) showLoadMoreBtn();
         }
       } catch (_) {}
     }
 
-    // ---- Polling ----
+    function getHistoryPageSize() {
+      return Number(appConfig.session.historyPageSize) || Number(appConfig.session.historyLimit) || DEFAULT_APP_CONFIG.session.historyPageSize;
+    }
+
+    function showLoadMoreBtn() {
+      let btn = document.getElementById('load-more-btn');
+      if (btn) return;
+      btn = document.createElement('button');
+      btn.id = 'load-more-btn';
+      btn.textContent = '⬆️ 加载更早的消息';
+      btn.style.cssText = 'display:block;margin:8px auto;padding:6px 16px;border:1px solid #ccc;border-radius:16px;background:var(--bg-secondary,#f0f0f0);color:var(--text-primary,#333);cursor:pointer;font-size:13px;';
+      btn.addEventListener('click', loadMoreHistory);
+      msgContainer.insertBefore(btn, msgContainer.firstChild);
+    }
+
+    function hideLoadMoreBtn() {
+      const btn = document.getElementById('load-more-btn');
+      if (btn) btn.remove();
+    }
+
+    async function loadMoreHistory() {
+      if (loadingMore) return;
+      const btn = document.getElementById('load-more-btn');
+      if (!btn || !earliestTimestamp) return;
+      loadingMore = true;
+      btn.textContent = '⏳ 加载中...';
+      btn.disabled = true;
+      const prevScrollHeight = msgContainer.scrollHeight;
+      const pageSize = getHistoryPageSize();
+      try {
+        const data = await (await fetch(`/api/history/before?before=${encodeURIComponent(earliestTimestamp)}&limit=${encodeURIComponent(pageSize)}`, { headers: authHeaders() })).json();
+        if (data.messages && data.messages.length > 0) {
+          const loadMoreBtn = document.getElementById('load-more-btn');
+          const tempDiv = document.createElement('div');
+          for (const m of data.messages) appendMessageTo(m.role, m.content, m.timestamp, tempDiv);
+          while (tempDiv.lastChild) msgContainer.insertBefore(tempDiv.lastChild, loadMoreBtn);
+          const firstRow = msgContainer.querySelector('.msg-row');
+          if (firstRow && firstRow.dataset.ts) earliestTimestamp = firstRow.dataset.ts;
+          msgContainer.scrollTop = msgContainer.scrollHeight - prevScrollHeight;
+          if (data.messages.length < pageSize) hideLoadMoreBtn();
+        } else {
+          hideLoadMoreBtn();
+        }
+      } catch (_) {}
+      loadingMore = false;
+      if (document.getElementById('load-more-btn')) {
+        const b = document.getElementById('load-more-btn');
+        b.textContent = '⬆️ 加载更早的消息';
+        b.disabled = false;
+      }
+    }
+
     function startPolling() { if (polling) return; polling = true; pollLoop(); }
     let lastRepliesJson = '';
     function pollLoop() {
       if (!polling) return;
-      fetch(`/api/poll?sessionId=${SHARED_SESSION}`, { headers: authHeaders() })
+      fetch(`/api/poll?sessionId=${encodeURIComponent(currentSessionId || appConfig.session.key)}`, { headers: authHeaders() })
         .then(r => r.json())
         .then(data => {
           if (data.status === 'error') {
@@ -166,9 +296,9 @@
               lastRepliesJson = json;
             }
             if (data.status === 'done') stopPolling();
-            if (polling) pollTimer = setTimeout(pollLoop, 1000);
+            if (polling) pollTimer = setTimeout(pollLoop, Number(appConfig.polling.clientStreamingIntervalMs) || 1000);
           } else {
-            pollTimer = setTimeout(pollLoop, 1500);
+            pollTimer = setTimeout(pollLoop, Number(appConfig.polling.clientProcessingIntervalMs) || 1500);
           }
         })
         .catch(err => { appendMessage('error', [{ type: 'text', text: 'Poll error: ' + err.message }]); stopPolling(); });
@@ -178,18 +308,29 @@
       sendBtn.disabled = false; chatStatus.style.display = 'none';
       lastRepliesJson = ''; loadHistory();
     }
+
+    async function loadModels() {
+      if (!modelSelect) return;
+      try {
+        const data = await (await fetch('/api/models', { headers: authHeaders() })).json();
+        availableModels = Array.isArray(data.models) ? data.models : [];
+        const fallbackModel = data.defaultModel || availableModels[0]?.id || '';
+        if (!availableModels.some(m => m.id === currentModel)) currentModel = fallbackModel;
+        modelSelect.innerHTML = availableModels.map(m => {
+          const selected = m.id === currentModel ? ' selected' : '';
+          return `<option value="${escapeAttr(m.id)}"${selected}>${escapeHtml(m.label || m.id)}</option>`;
+        }).join('');
+        if (currentModel) localStorage.setItem('oc_model', currentModel);
+        modelSelect.disabled = availableModels.length === 0;
+      } catch (_) {
+        modelSelect.innerHTML = '<option value="">模型加载失败</option>';
+        modelSelect.disabled = true;
+      }
+    }
   }
 
-  // ---- Render ----
-  // Simple rule:
-  //   - user/assistant messages with text/image: ALWAYS visible
-  //   - assistant messages with only toolCall (no text/image): hidden by default
-  //   - toolResult messages: hidden by default
-  //   - All hidden content goes into a .tool-block, toggled by the tools button
-
-  function appendMessage(role, content, ts) {
-    const msgContainer = document.getElementById('messages');
-    const welcome = msgContainer.querySelector('.welcome-msg');
+  function appendMessageTo(role, content, ts, container) {
+    const welcome = container.querySelector('.welcome-msg');
     if (welcome) welcome.remove();
 
     let parts;
@@ -197,34 +338,18 @@
     else if (Array.isArray(content)) parts = content;
     else parts = [{ type: 'text', text: String(content) }];
 
-    // Separate visible content from tool/process content
-    const visibleParts = [];  // text + image (always shown)
-    const toolParts = [];     // toolCall + toolResult (hidden by default)
-
+    const visibleParts = [];
+    const toolParts = [];
     for (const p of parts) {
-      if (p.type === 'toolCall' || p.type === 'toolResult') {
-        toolParts.push(p);
-      } else {
-        visibleParts.push(p);
-      }
+      if (p.type === 'toolCall' || p.type === 'toolResult') toolParts.push(p);
+      else visibleParts.push(p);
     }
-
-    // Nothing to show at all (e.g. assistant with only toolCalls, no text/image)
-    // Only render if there's visible content, OR hidden tool parts to toggle
     if (visibleParts.length === 0 && toolParts.length === 0) return;
+    if (visibleParts.length === 0) return;
 
-    // If only tool parts (no visible text/image), skip the bubble row entirely
-    // Tool content only shows inside a visible bubble's .tool-block
-    if (visibleParts.length === 0) {
-      // Don't render — these are pure tool calls with no text output
-      // They'll be attached to the next text message's tool-block
-      return;
-    }
-
-    // Build the bubble HTML
     let html = '';
     let textAccum = '';
-    let images = [];
+    const images = [];
     for (const part of visibleParts) {
       if (part.type === 'text') {
         textAccum += (textAccum ? '\n' : '') + (part.text || '');
@@ -234,11 +359,8 @@
       }
     }
     if (textAccum) html += renderMarkdown(textAccum);
-    for (const url of images) {
-      html += `<img class="msg-image" src="${url}" alt="image" loading="lazy" onclick="window.open(this.src,'_blank')" />`;
-    }
+    for (const url of images) html += `<img class="msg-image" src="${escapeAttr(url)}" alt="image" loading="lazy" onclick="window.open(this.src,'_blank')" />`;
 
-    // Append hidden tool blocks if any (inside the same bubble)
     if (toolParts.length > 0) {
       html += '<div class="tool-block" style="display:' + (showTools ? 'block' : 'none') + '">';
       for (const tp of toolParts) {
@@ -246,19 +368,21 @@
           const args = formatToolArgs(tp.arguments);
           html += `<div class="tool-call"><span class="tool-name">⚡ ${escapeHtml(tp.name)}</span><pre class="tool-args">${escapeHtml(args)}</pre></div>`;
         } else if (tp.type === 'toolResult' && tp.text) {
-          html += `<div class="tool-result"><span class="tool-label">📤 结果</span><pre>${escapeHtml(tp.text.slice(0, 500))}</pre></div>`;
+          const maxChars = Number(appConfig.ui.toolResultPreviewChars) || DEFAULT_APP_CONFIG.ui.toolResultPreviewChars;
+          html += `<div class="tool-result"><span class="tool-label">📤 结果</span><pre>${escapeHtml(tp.text.slice(0, maxChars))}</pre></div>`;
         }
       }
       html += '</div>';
     }
 
-    // Build DOM
     const row = document.createElement('div');
     row.className = `msg-row ${role === 'error' ? 'error' : role}`;
+    const d = ts ? new Date(ts) : new Date();
+    row.dataset.ts = ts || d.toISOString();
 
     const avatar = document.createElement('div');
     avatar.className = 'msg-avatar';
-    avatar.textContent = role === 'user' ? 'U' : role === 'error' ? '!' : 'FC';
+    avatar.textContent = role === 'user' ? appConfig.branding.avatarUser : role === 'error' ? '!' : appConfig.branding.avatarBot;
 
     const bubble = document.createElement('div');
     bubble.className = `msg-bubble${role === 'error' ? ' error' : ''}`;
@@ -269,13 +393,17 @@
 
     const time = document.createElement('div');
     time.className = 'msg-time';
-    const d = ts ? new Date(ts) : new Date();
     time.textContent = d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
     wrapper.appendChild(time);
 
     row.appendChild(avatar);
     row.appendChild(wrapper);
-    msgContainer.appendChild(row);
+    container.appendChild(row);
+  }
+
+  function appendMessage(role, content, ts) {
+    const msgContainer = document.getElementById('messages');
+    appendMessageTo(role, content, ts, msgContainer);
     msgContainer.scrollTop = msgContainer.scrollHeight;
     lastMessageCount = msgContainer.querySelectorAll('.msg-row').length;
   }
@@ -290,13 +418,11 @@
 
   function renderMarkdown(text) {
     if (!text) return '';
-    // 1. Extract images BEFORE escaping (URLs must stay raw)
     const images = [];
     text = text.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_, alt, url) => {
       images.push({ alt, url });
       return '';
     });
-    // 2. Escape the rest
     let html = escapeHtml(text);
     html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => `<pre><code>${code.trim()}</code></pre>`);
     html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
@@ -306,24 +432,21 @@
     html = html.replace(/\n\n/g, '</p><p>');
     html = html.replace(/\n/g, '<br>');
     html = '<p>' + html + '</p>';
-    // Append extracted images (URLs kept raw, not escaped)
-    for (const img of images) {
-      html += `<img class="msg-image" src="${img.url}" alt="${escapeAttr(img.alt || '')}" loading="lazy" onclick="window.open(this.src,'_blank')" />`;
-    }
+    for (const img of images) html += `<img class="msg-image" src="${escapeAttr(img.url)}" alt="${escapeAttr(img.alt || '')}" loading="lazy" onclick="window.open(this.src,'_blank')" />`;
     html = html.replace(/<p>\s*<\/p>/g, '');
     return html;
   }
 
   function escapeHtml(s) {
+    s = String(s ?? '');
     const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' };
     return s.replace(/[&<>"']/g, c => map[c]);
   }
 
   function escapeAttr(s) {
-    return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return String(s ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', init);
-  } else { init(); }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+  else init();
 })();

@@ -8,16 +8,43 @@
   },
   "gateway": {
     "wsUrl": "ws://127.0.0.1:18789",
-    "token": "your-openclaw-gateway-token-here"
+    "token": "your-openclaw-gateway-token-here",
+    "scopes": [
+      "operator.read",
+      "operator.write",
+      "operator.admin"
+    ],
+    "rpcTimeoutMs": 120000
+  },
+  "models": {
+    "openclawConfigPath": "/root/.openclaw/openclaw.json",
+    "allowedProviders": [
+      "glmcode"
+    ]
   },
   "session": {
     "key": "webchat-shared",
-    "historyLimit": 500
+    "historyLimit": 500,
+    "pollLimit": 20,
+    "historyPageSize": 100
+  },
+  "polling": {
+    "historyIntervalMs": 2000,
+    "doneDelayMs": 5000,
+    "safetyTimeoutMs": 300000,
+    "clientStreamingIntervalMs": 1000,
+    "clientProcessingIntervalMs": 1500
   },
   "branding": {
     "name": "FastClaw",
     "emoji": "🐾",
     "avatarBot": "FC",
-    "avatarUser": "U"
+    "avatarUser": "U",
+    "welcomeTitle": "Welcome to FastClaw",
+    "welcomeSubtitle": "Send a message to start chatting.",
+    "documentTitle": "FastClaw Chat"
+  },
+  "ui": {
+    "toolResultPreviewChars": 500
   }
 }

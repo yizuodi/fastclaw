@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>FastClaw Chat</title>
-  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/style.css?v=20260425-configurable">
 </head>
 <body>
   <div id="app">
@@ -16,7 +16,11 @@
             <path d="M2 17l10 5 10-5"/>
             <path d="M2 12l10 5 10-5"/>
           </svg>
-          <span>FastClaw</span>
+          <span id="brand-name">FastClaw</span>
+        </div>
+        <div class="header-model-picker">
+          <label for="model-select">模型</label>
+          <select id="model-select" title="选择对话模型"></select>
         </div>
         <span id="chat-status" class="typing-indicator" style="display:none">thinking...</span>
         <button id="theme-toggle" title="切换主题">
@@ -31,9 +35,9 @@
 
       <div id="messages">
         <div class="welcome-msg">
-          <div class="welcome-icon">🐾</div>
-          <h2>Welcome to FastClaw</h2>
-          <p>Send a message to start chatting.</p>
+          <div id="welcome-icon" class="welcome-icon">🐾</div>
+          <h2 id="welcome-title">Welcome to FastClaw</h2>
+          <p id="welcome-subtitle">Send a message to start chatting.</p>
         </div>
       </div>
 
@@ -48,6 +52,6 @@
     </main>
   </div>
 
-  <script src="/app.js"></script>
+  <script src="/app.js?v=20260425-configurable"></script>
 </body>
 </html>

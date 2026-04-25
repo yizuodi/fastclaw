@@ -40,17 +40,38 @@ cp config.example.json config.json
   },
   "gateway": {
     "wsUrl": "ws://127.0.0.1:18789",
-    "token": "你的 OpenClaw Gateway Token"
+    "token": "你的 OpenClaw Gateway Token",
+    "scopes": ["operator.read", "operator.write", "operator.admin"],
+    "rpcTimeoutMs": 120000
+  },
+  "models": {
+    "openclawConfigPath": "/root/.openclaw/openclaw.json",
+    "allowedProviders": ["glmcode"]
   },
   "session": {
     "key": "webchat-shared",
-    "historyLimit": 500
+    "historyLimit": 500,
+    "pollLimit": 20,
+    "historyPageSize": 100
+  },
+  "polling": {
+    "historyIntervalMs": 2000,
+    "doneDelayMs": 5000,
+    "safetyTimeoutMs": 300000,
+    "clientStreamingIntervalMs": 1000,
+    "clientProcessingIntervalMs": 1500
   },
   "branding": {
     "name": "FastClaw",
     "emoji": "🐾",
     "avatarBot": "FC",
-    "avatarUser": "U"
+    "avatarUser": "U",
+    "welcomeTitle": "Welcome to FastClaw",
+    "welcomeSubtitle": "Send a message to start chatting.",
+    "documentTitle": "FastClaw Chat"
+  },
+  "ui": {
+    "toolResultPreviewChars": 500
   }
 }
 ```
@@ -84,14 +105,29 @@ PORT=3000 npm start
 | `auth.password` | 访问密码（留空则不验证） | - |
 | `gateway.wsUrl` | OpenClaw Gateway WebSocket 地址 | `ws://127.0.0.1:18789` |
 | `gateway.token` | OpenClaw Gateway Token | - |
+| `gateway.scopes` | Gateway 连接权限范围 | `["operator.read","operator.write","operator.admin"]` |
+| `gateway.rpcTimeoutMs` | RPC 请求超时时间（毫秒） | `120000` |
+| `models.openclawConfigPath` | OpenClaw 配置文件路径 | `/root/.openclaw/openclaw.json` |
+| `models.allowedProviders` | 允许的模型提供商列表 | `["glmcode"]` |
 | `session.key` | 共享 Session 标识 | `webchat-shared` |
-| `session.historyLimit` | 历史消息拉取上限 | `500` |
+| `session.historyLimit` | 首次历史消息拉取上限 | `500` |
+| `session.pollLimit` | 后端轮询 Gateway 历史时的消息上限 | `20` |
+| `session.historyPageSize` | 前端“加载更早消息”的分页大小 | `100` |
+| `polling.historyIntervalMs` | 后端历史轮询间隔（毫秒） | `2000` |
+| `polling.doneDelayMs` | 响应稳定后标记完成延迟（毫秒） | `5000` |
+| `polling.safetyTimeoutMs` | 单次请求安全超时（毫秒） | `300000` |
+| `polling.clientStreamingIntervalMs` | 前端收到流式更新后的轮询间隔（毫秒） | `1000` |
+| `polling.clientProcessingIntervalMs` | 前端等待处理时的轮询间隔（毫秒） | `1500` |
 | `branding.name` | 品牌名称 | `FastClaw` |
 | `branding.emoji` | Logo Emoji | `🐾` |
 | `branding.avatarBot` | AI 头像文字 | `FC` |
 | `branding.avatarUser` | 用户头像文字 | `U` |
+| `branding.welcomeTitle` | 欢迎页标题 | `Welcome to FastClaw` |
+| `branding.welcomeSubtitle` | 欢迎页副标题 | `Send a message to start chatting.` |
+| `branding.documentTitle` | 浏览器标题 | `FastClaw Chat` |
+| `ui.toolResultPreviewChars` | 工具结果预览截断长度 | `500` |
 
-环境变量优先级高于配置文件：`PORT`、`AUTH_TOKEN`、`GW_WS_URL`、`GW_TOKEN`。
+环境变量优先级高于配置文件：`PORT`、`AUTH_TOKEN`、`GW_WS_URL`、`GW_TOKEN`、`OPENCLAW_CONFIG_PATH`。
 
 ## 📁 项目结构
 

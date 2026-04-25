@@ -11,15 +11,28 @@ if (!fs.existsSync(CONFIG_PATH)) {
   process.exit(1);
 }
 const config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+const OPENCLAW_CONFIG_PATH = process.env.OPENCLAW_CONFIG_PATH || config.models?.openclawConfigPath || '/root/.openclaw/openclaw.json';
 
 const PORT = process.env.PORT || config.server?.port || 23456;
 const HOST = config.server?.host || '0.0.0.0';
 const AUTH_TOKEN = process.env.AUTH_TOKEN || config.auth?.password || '';
 const GW_WS_URL = process.env.GW_WS_URL || config.gateway?.wsUrl || 'ws://127.0.0.1:18789';
 const GW_TOKEN = process.env.GW_TOKEN || config.gateway?.token || '';
+const SCOPES = config.gateway?.scopes || ['operator.read', 'operator.write', 'operator.admin'];
+const RPC_TIMEOUT_MS = config.gateway?.rpcTimeoutMs || 120000;
 const SESSION_KEY = config.session?.key || 'webchat-shared';
-const HISTORY_LIMIT = config.session?.historyLimit || 500;
+const HISTORY_LIMIT = config.session?.historyLimit || 100;
+const POLL_LIMIT = config.session?.pollLimit || 20;
 const BRAND = config.branding || {};
+const POLL_INTERVAL_MS = config.polling?.historyIntervalMs || 2000;
+const DONE_DELAY_MS = config.polling?.doneDelayMs || 5000;
+const SAFETY_TIMEOUT_MS = config.polling?.safetyTimeoutMs || 300000;
+const CLIENT_STREAMING_INTERVAL_MS = config.polling?.clientStreamingIntervalMs || 1000;
+const CLIENT_PROCESSING_INTERVAL_MS = config.polling?.clientProcessingIntervalMs || 1500;
+const ALLOWED_MODEL_PROVIDERS = new Set(config.models?.allowedProviders || ['glmcode']);
+const UI = config.ui || {};
+const HISTORY_PAGE_SIZE = UI.historyPageSize || config.session?.historyPageSize || HISTORY_LIMIT;
+const TOOL_RESULT_PREVIEW_CHARS = UI.toolResultPreviewChars || 500;
 
 // ============ State ============
 const sessions = new Map();
@@ -53,6 +66,40 @@ function extractImages(msg) {
     else if (c.type === 'image' && c.url) urls.push(c.url);
   }
   return urls;
+}
+
+function loadAvailableModels() {
+  try {
+    if (!fs.existsSync(OPENCLAW_CONFIG_PATH)) return [];
+    const oc = JSON.parse(fs.readFileSync(OPENCLAW_CONFIG_PATH, 'utf8'));
+    const providers = oc?.models?.providers || {};
+    const models = [];
+    for (const [providerId, providerCfg] of Object.entries(providers)) {
+      if (!ALLOWED_MODEL_PROVIDERS.has(providerId)) continue;
+      for (const model of providerCfg?.models || []) {
+        const rawId = typeof model === 'string'
+          ? model
+          : (model?.id || model?.name || model?.model || model?.label || '');
+        const id = String(rawId || '').trim();
+        if (!id) continue;
+        models.push({
+          id: `${providerId}/${id}`,
+          provider: providerId,
+          model: id,
+          label: `${providerId}/${id}`
+        });
+      }
+    }
+    return models;
+  } catch (err) {
+    console.error('[Models] Failed to load:', err.message);
+    return [];
+  }
+}
+
+function getDefaultModel() {
+  const models = loadAvailableModels();
+  return models[0]?.id || null;
 }
 
 // ============ Device Identity ============
@@ -96,12 +143,12 @@ function connectGateway() {
 function sendConnect(nonce) {
   const { deviceId, publicKeyPem, privateKeyPem } = deviceIdentity;
   const t = Date.now();
-  const v3 = ['v3', deviceId, 'cli', 'cli', 'operator', 'operator.read,operator.write', String(t), GW_TOKEN, nonce, 'linux', 'server'].join('|');
+  const v3 = ['v3', deviceId, 'cli', 'cli', 'operator', SCOPES.join(','), String(t), GW_TOKEN, nonce, 'linux', 'server'].join('|');
   const sig = base64UrlEncode(crypto.sign(null, Buffer.from(v3, 'utf8'), crypto.createPrivateKey(privateKeyPem)));
   gwWs.send(JSON.stringify({ type: 'req', id: '0', method: 'connect', params: {
     minProtocol: 3, maxProtocol: 3,
     client: { id: 'cli', version: '1.0.0', platform: 'linux', mode: 'cli', deviceFamily: 'server' },
-    role: 'operator', scopes: ['operator.read','operator.write'], caps: [], commands: [], permissions: {},
+    role: 'operator', scopes: SCOPES, caps: [], commands: [], permissions: {},
     auth: { token: GW_TOKEN }, locale: 'zh-CN', userAgent: 'fastclaw-webchat/1.0.0',
     device: { id: deviceId, publicKey: publicKeyPem, signature: sig, signedAt: t, nonce: nonce },
   }}));
@@ -113,14 +160,14 @@ function sendRpc(method, params) {
     const id = String(++rpcId);
     rpcPending.set(id, { resolve, reject });
     gwWs.send(JSON.stringify({ type: 'req', id, method, params }));
-    setTimeout(() => { if (rpcPending.has(id)) { rpcPending.delete(id); reject(new Error('RPC timeout')); } }, 120000);
+    setTimeout(() => { if (rpcPending.has(id)) { rpcPending.delete(id); reject(new Error('RPC timeout')); } }, RPC_TIMEOUT_MS);
   });
 }
 
 // ============ History Poller ============
 setInterval(() => {
   for (const [sid, state] of activeSessions) checkHistory(sid, state);
-}, 2000);
+}, POLL_INTERVAL_MS);
 
 async function checkHistory(sid, state) {
   const gwKey = sessionKeyMap.get(sid);
@@ -128,7 +175,7 @@ async function checkHistory(sid, state) {
   const fullKey = gwKey.startsWith('agent:') ? gwKey : `agent:main:${gwKey}`;
 
   // 5 min safety timeout
-  if (Date.now() - state.sendTime > 300000) {
+  if (Date.now() - state.sendTime > SAFETY_TIMEOUT_MS) {
     if (state.lastReplies.length > 0) {
       pendingPollReplies.set(sid, { replies: state.lastReplies, status: 'done', timestamp: Date.now() });
     } else {
@@ -140,7 +187,7 @@ async function checkHistory(sid, state) {
   }
 
   try {
-    const res = await sendRpc('chat.history', { sessionKey: fullKey, limit: HISTORY_LIMIT });
+    const res = await sendRpc('chat.history', { sessionKey: fullKey, limit: POLL_LIMIT });
     const messages = res.payload?.messages || [];
 
     // Find our sent message by content (last match)
@@ -158,7 +205,7 @@ async function checkHistory(sid, state) {
       if (m.role === 'toolResult') {
         const text = extractText(m);
         const content = [];
-        if (text) content.push({ type: 'toolResult', text: text.slice(0, 500) });
+        if (text) content.push({ type: 'toolResult', text: text.slice(0, TOOL_RESULT_PREVIEW_CHARS) });
         if (content.length > 0) newReplies.push({ role: 'toolResult', content });
         continue;
       }
@@ -188,7 +235,7 @@ async function checkHistory(sid, state) {
     }
 
     if (!state.doneSince) state.doneSince = Date.now();
-    if (Date.now() - state.doneSince >= 5000) {
+    if (Date.now() - state.doneSince >= DONE_DELAY_MS) {
       pendingPollReplies.set(sid, { replies: newReplies, status: 'done', timestamp: Date.now() });
       activeSessions.delete(sid);
       console.log(`[Poller] Done ${sid} (${newReplies.length} replies)`);
@@ -230,6 +277,8 @@ const server = http.createServer((req, res) => {
   if (req.method === 'POST' && url.pathname === '/api/send') return handleSend(req, res);
   if (req.method === 'GET' && url.pathname === '/api/poll') return handlePoll(req, res, url);
   if (req.method === 'GET' && url.pathname === '/api/history') return handleHistory(req, res);
+  if (req.method === 'GET' && url.pathname === '/api/history/before') return handleHistoryBefore(req, res, url);
+  if (req.method === 'GET' && url.pathname === '/api/models') return handleModels(req, res);
   if (req.method === 'GET' && url.pathname === '/api/status') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ gateway: gwReady ? 'connected' : 'disconnected' }));
@@ -244,10 +293,40 @@ const server = http.createServer((req, res) => {
 function serveBranding(res) {
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
-    name: BRAND.name || 'FastClaw',
-    emoji: BRAND.emoji || '🐾',
-    avatarBot: BRAND.avatarBot || 'FC',
-    avatarUser: BRAND.avatarUser || 'U'
+    branding: {
+      name: BRAND.name || 'FastClaw',
+      emoji: BRAND.emoji || '🐾',
+      avatarBot: BRAND.avatarBot || 'FC',
+      avatarUser: BRAND.avatarUser || 'U',
+      welcomeTitle: BRAND.welcomeTitle || `Welcome to ${BRAND.name || 'FastClaw'}`,
+      welcomeSubtitle: BRAND.welcomeSubtitle || 'Send a message to start chatting.',
+      documentTitle: BRAND.documentTitle || `${BRAND.name || 'FastClaw'} Chat`
+    },
+    session: {
+      key: SESSION_KEY,
+      historyLimit: HISTORY_LIMIT,
+      pollLimit: POLL_LIMIT,
+      historyPageSize: HISTORY_PAGE_SIZE
+    },
+    polling: {
+      historyIntervalMs: POLL_INTERVAL_MS,
+      doneDelayMs: DONE_DELAY_MS,
+      safetyTimeoutMs: SAFETY_TIMEOUT_MS,
+      clientStreamingIntervalMs: CLIENT_STREAMING_INTERVAL_MS,
+      clientProcessingIntervalMs: CLIENT_PROCESSING_INTERVAL_MS
+    },
+    ui: {
+      toolResultPreviewChars: TOOL_RESULT_PREVIEW_CHARS
+    }
+  }));
+}
+
+function handleModels(req, res) {
+  const models = loadAvailableModels();
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    models,
+    defaultModel: getDefaultModel()
   }));
 }
 
@@ -256,10 +335,17 @@ function handleSend(req, res) {
   req.on('data', chunk => body += chunk);
   req.on('end', () => {
     try {
-      const { message } = JSON.parse(body);
+      const { message, model } = JSON.parse(body);
       if (!message || !message.trim()) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ error: 'Message is required' }));
+      }
+
+      const allowedModels = loadAvailableModels();
+      const selectedModel = allowedModels.find(m => m.id === model)?.id || getDefaultModel();
+      if (!selectedModel) {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'No available models configured' }));
       }
 
       const sid = SESSION_KEY;
@@ -274,6 +360,7 @@ function handleSend(req, res) {
       sendRpc('agent', {
         sessionKey: sid,
         message: trimmed,
+        model: selectedModel,
         bestEffortDeliver: true,
         idempotencyKey: 'wc-' + crypto.randomUUID(),
       })
@@ -325,34 +412,61 @@ function handlePoll(req, res, url) {
   res.end(JSON.stringify({ status: 'processing' }));
 }
 
-function handleHistory(req, res) {
-  const fullKey = `agent:main:${SESSION_KEY}`;
-  sendRpc('chat.history', { sessionKey: fullKey, limit: HISTORY_LIMIT })
-    .then(rpcRes => {
-      const messages = rpcRes.payload?.messages || [];
-      const formatted = messages.map(m => {
-        const parts = [];
-        if (Array.isArray(m.content)) {
-          for (const c of m.content) {
-            if (c.type === 'text' && c.text) {
-              const partType = m.role === 'toolResult' ? 'toolResult' : 'text';
-              parts.push({ type: partType, text: c.text });
-            } else if (c.type === 'image_url' && c.image_url?.url) {
-              parts.push({ type: 'image', url: c.image_url.url });
-            } else if (c.type === 'image' && c.url) {
-              parts.push({ type: 'image', url: c.url });
-            } else if (c.type === 'toolCall' && c.name) {
-              parts.push({ type: 'toolCall', name: c.name, arguments: c.arguments });
-            } else if (c.type === 'toolResult') {
-              parts.push({ type: 'toolResult', text: c.text || c.content || '' });
-            }
-          }
-        } else if (typeof m.content === 'string') {
+// Format raw gateway messages into frontend-friendly format
+function formatMessages(messages) {
+  return messages.map(m => {
+    const parts = [];
+    if (Array.isArray(m.content)) {
+      for (const c of m.content) {
+        if (c.type === 'text' && c.text) {
           const partType = m.role === 'toolResult' ? 'toolResult' : 'text';
-          parts.push({ type: partType, text: m.content });
+          parts.push({ type: partType, text: c.text });
+        } else if (c.type === 'image_url' && c.image_url?.url) {
+          parts.push({ type: 'image', url: c.image_url.url });
+        } else if (c.type === 'image' && c.url) {
+          parts.push({ type: 'image', url: c.url });
+        } else if (c.type === 'toolCall' && c.name) {
+          parts.push({ type: 'toolCall', name: c.name, arguments: c.arguments });
+        } else if (c.type === 'toolResult') {
+          parts.push({ type: 'toolResult', text: c.text || c.content || '' });
         }
-        return { role: m.role, content: parts, timestamp: m.timestamp };
-      }).filter(m => m.content.length > 0);
+      }
+    } else if (typeof m.content === 'string') {
+      const partType = m.role === 'toolResult' ? 'toolResult' : 'text';
+      parts.push({ type: partType, text: m.content });
+    }
+    return { role: m.role, content: parts, timestamp: m.timestamp };
+  }).filter(m => m.content.length > 0);
+}
+
+function handleHistory(req, res) {
+  const url = new URL(req.url, `http://localhost:${PORT}`);
+  const limit = parseInt(url.searchParams.get('limit') || '', 10) || HISTORY_LIMIT;
+  const fullKey = `agent:main:${SESSION_KEY}`;
+  sendRpc('chat.history', { sessionKey: fullKey, limit })
+    .then(rpcRes => {
+      const formatted = formatMessages(rpcRes.payload?.messages || []);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ messages: formatted }));
+    })
+    .catch(() => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ messages: [] }));
+    });
+}
+
+// Load older messages before a given timestamp (for "load more")
+function handleHistoryBefore(req, res, url) {
+  const before = url.searchParams.get('before');
+  const limit = parseInt(url.searchParams.get('limit') || '', 10) || HISTORY_LIMIT;
+  if (!before) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ error: 'before parameter required' }));
+  }
+  const fullKey = `agent:main:${SESSION_KEY}`;
+  sendRpc('chat.history', { sessionKey: fullKey, limit, before })
+    .then(rpcRes => {
+      const formatted = formatMessages(rpcRes.payload?.messages || []);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ messages: formatted }));
     })
